@@ -6,9 +6,11 @@
 # pyannote/segmentation-3.0 on HuggingFace and provide a token (PARASCRIBE_HF_TOKEN
 # or hf_token_file) for the first download; afterwards it runs offline from cache.
 #
-# torch: pyannote pulls a torch build. For GPU, install the CUDA torch wheel that
-# matches your host first. For the 1080 Ti (Pascal sm_61), verify the CUDA wheel
-# runs there, or run diarization on CPU (PARASCRIBE_DIARIZATION_DEVICE=cpu).
-# Lock exact pins after first validation on the target GPU (as we did for
-# onnxruntime-gpu).
-pyannote.audio==3.3.2
+# pyannote.audio 4.x targets the modern stack: huggingface_hub 1.x (token API),
+# torchaudio >= 2.8 (after AudioMetaData was removed), numpy 2, modern torch. It
+# pulls compatible torch/torchaudio (>= 2.8) itself, so they are not pinned here.
+# NOTE: torch >= 2.8 may not ship Pascal (sm_61) kernels, so on the 1080 Ti run
+# diarization on CPU (PARASCRIBE_DIARIZATION_DEVICE=cpu); the 3090 (sm_86) runs on
+# GPU. Lock the resolved torch/torchaudio versions here after validating on the
+# target GPU (as we did for onnxruntime-gpu).
+pyannote.audio==4.0.5

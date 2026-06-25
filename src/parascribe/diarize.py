@@ -9,9 +9,9 @@ if the deps or gated models are missing (never a silent no-speaker fallback).
 The model produces opaque speaker labels (SPEAKER_00, ...). Diarization runs the
 whole file (clustering is global), so it is not streamable.
 
-NOTE: written against pyannote.audio's documented 3.1 API. The gated models
-(pyannote/speaker-diarization-3.1, segmentation-3.0) require a HuggingFace token +
-license acceptance for the first download; validate on GPU hardware.
+NOTE: targets pyannote.audio 4.x (modern huggingface_hub `token=` API). The gated
+models require a HuggingFace token + license acceptance for the first download;
+validate on GPU hardware.
 """
 
 from __future__ import annotations
@@ -52,7 +52,7 @@ class Diarizer:
 
         logger.info("loading diarization model %s on %s", settings.diarization_model, device)
         pipeline = Pipeline.from_pretrained(
-            settings.diarization_model, use_auth_token=settings.resolved_hf_token()
+            settings.diarization_model, token=settings.resolved_hf_token()
         )
         if pipeline is None:
             # pyannote returns None when the model is gated and access/token is missing.
