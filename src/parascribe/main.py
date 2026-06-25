@@ -193,7 +193,7 @@ def create_app(
         app.state.diarizer = diarizer or (
             Diarizer(settings) if settings.enable_diarization else None
         )
-        app.state.gate = InferenceGate(settings.max_queue + 1)
+        app.state.gate = InferenceGate(settings.max_queue)
         logger.info(
             "ready: model=%s provider=%s diarization=%s max_queue=%d",
             settings.model_id, settings.execution_provider,

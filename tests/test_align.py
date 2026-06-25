@@ -62,6 +62,14 @@ class TestApplySpeakers:
         assert out.segments[0].speaker == "SPEAKER_00"
         assert out.words[0].speaker == "SPEAKER_00"
 
+    def test_equal_overlap_tie_breaks_to_earliest_turn(self):
+        # Word [1,3] overlaps both turns equally (1.0s each); earliest (start 0) wins,
+        # even when turns are passed out of chronological order.
+        turns = [SpeakerTurn(2.0, 4.0, "SPEAKER_01"), SpeakerTurn(0.0, 2.0, "SPEAKER_00")]
+        t = transcript([Segment(0, 0.0, 4.0, "x")], [Word("x", 1.0, 3.0)])
+        out = apply_speakers(t, turns)
+        assert out.words[0].speaker == "SPEAKER_00"
+
     def test_no_turns_returns_unchanged(self):
         t = transcript(
             [Segment(0, 0.0, 2.0, "a", speaker=None)],

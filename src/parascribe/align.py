@@ -49,6 +49,10 @@ def apply_speakers(transcript: Transcript, turns: list[SpeakerTurn]) -> Transcri
     if not turns:
         return transcript
 
+    # Sort by start so that on equal overlap the earliest turn wins the tie,
+    # independent of the order the caller passed turns in.
+    turns = sorted(turns, key=lambda t: t.start)
+
     new_words = [
         replace(word, speaker=_best_speaker(word.start, word.end, turns))
         for word in transcript.words

@@ -163,8 +163,9 @@ Pipeline:
    word. Emit `words[]` with `word.start` = first sub-token global ts, `word.end`
    = last sub-token global ts.
 5. **Assemble:** map each segment to the OpenAI segment shape with sequential
-   `id`, absolute `start`/`end`, `text`, `speaker: null`, and optional numeric
-   confidence from `logprobs` (`exp(mean(logprobs))`). Concatenate text.
+   `id`, absolute `start`/`end`, `text`, `speaker: null`, and `avg_logprob` =
+   mean of the segment's token `logprobs` (the Whisper/OpenAI-style raw mean
+   log-probability, not exponentiated). Concatenate text.
 6. Return unified `verbose_json` (or the requested format).
 
 `chunk_overlap_s` (decision #2) defaults to **0**; it maps to VAD pad, not an
@@ -212,17 +213,18 @@ Params (OpenAI-compatible):
   "duration": 6963.67,
   "text": "full transcript ...",
   "segments": [
-    { "id": 0, "start": 0.00, "end": 4.20, "text": "...", "speaker": null }
+    { "id": 0, "start": 0.00, "end": 4.20, "text": "...", "speaker": null, "avg_logprob": -0.12 }
   ],
   "words": [ { "word": "...", "start": 0.00, "end": 0.32 } ]
 }
 ```
-- Populate only fields actually available from `onnx-asr`. Whisper-only fields
-  (`seek`, `avg_logprob`, `tokens`, `no_speech_prob`, ...) may be omitted or null
-  — document which in the README. Include per-segment numeric confidence iff the
-  library provides one.
-- **`speaker` present on every segment, `null` in Phase 0** (diarization
-  forward-compat; matches OpenAI's emerging `diarized_json` shape).
+- Populate only fields actually available from `onnx-asr`. Each segment carries
+  `avg_logprob` (the mean of its token log-probabilities, Whisper/OpenAI-style raw
+  log-prob — not exponentiated). Whisper-only fields not produced here (`seek`,
+  `tokens`, `compression_ratio`, `no_speech_prob`, `temperature`) are omitted.
+- **`speaker` present on every segment**: an opaque label (`SPEAKER_NN`) when
+  diarization is requested, otherwise `null`. Matches OpenAI's emerging
+  `diarized_json` shape.
 - `srt`/`vtt` are formatted from the same offset-corrected segments.
 
 ### `GET /health`
