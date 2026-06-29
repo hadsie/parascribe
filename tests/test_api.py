@@ -14,6 +14,7 @@ from parascribe.align import SpeakerTurn
 from parascribe.asr import RawSegment
 from parascribe.config import Settings
 from parascribe.main import InferenceGate, QueueFullError, create_app
+from parascribe.registry import ModelRegistry
 
 _TOK = [" The", " second", " part", "."]
 _TS = [0.0, 0.4, 0.8, 1.2]
@@ -76,6 +77,19 @@ def make_client(tmp_path: Path, *, diarizer=None, **overrides) -> TestClient:
     return TestClient(
         create_app(settings=settings, transcriber=FakeTranscriber(), diarizer=diarizer)
     )
+
+
+def make_multi_client(tmp_path: Path, models, **overrides) -> TestClient:
+    settings = Settings(
+        execution_provider="cpu",
+        work_dir=tmp_path / "work",
+        api_key="secret",
+        models=models,
+        **overrides,
+    )
+    registry = ModelRegistry(settings, factory=lambda _model_id: FakeTranscriber())
+    registry.preload()  # loads the default model (sets device/provider for /health)
+    return TestClient(create_app(settings=settings, registry=registry))
 
 
 def post(client, wav, *, key="secret", **data):
@@ -162,6 +176,32 @@ class TestHealth:
             assert body["status"] == "ok"
             assert body["provider_active"] is True
             assert body["device"] == "cpu"
+
+    def test_health_single_mode(self, tmp_path):
+        with make_client(tmp_path) as client:
+            assert client.get("/health").json()["mode"] == "single"
+
+    def test_health_multi_mode_lists_models(self, tmp_path):
+        with make_multi_client(tmp_path, models=["m1", "m2"]) as client:
+            body = client.get("/health").json()
+            assert body["mode"] == "multi"
+            assert {"m1", "m2"} <= set(body["models"])
+            assert body["loaded"]  # default model preloaded
+
+
+class TestMultiModel:
+    def test_allowed_model_is_200(self, tmp_path, wav):
+        with make_multi_client(tmp_path, models=["m1", "m2"]) as client:
+            assert post(client, wav, model="m1").status_code == 200
+
+    def test_unknown_model_is_400(self, tmp_path, wav):
+        with make_multi_client(tmp_path, models=["m1", "m2"]) as client:
+            assert post(client, wav, model="nope").status_code == 400
+
+    def test_single_mode_ignores_unknown_model(self, tmp_path, wav):
+        # No allow-list => the model field is not used for routing; any value works.
+        with make_client(tmp_path) as client:
+            assert post(client, wav, model="whatever").status_code == 200
 
 
 class TestStreaming:

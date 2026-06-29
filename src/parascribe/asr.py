@@ -63,6 +63,15 @@ def build_providers(settings: Settings) -> ProviderSpec:
     return ["CPUExecutionProvider"]
 
 
+def build_vad(settings: Settings) -> object:
+    """Load the silero VAD with the configured providers.
+
+    The VAD is model-independent, so the registry loads one and shares it across
+    every Transcriber rather than reloading it per model.
+    """
+    return onnx_asr.load_vad("silero", providers=build_providers(settings))
+
+
 def _iter_sessions(
     obj: object, seen: set[int] | None = None, depth: int = 0
 ) -> Iterator[ort.InferenceSession]:
@@ -95,18 +104,19 @@ class Transcriber:
     callers must hold the single-flight lock around it.
     """
 
-    def __init__(self, settings: Settings) -> None:
+    def __init__(
+        self, settings: Settings, *, model_id: str | None = None, vad: object | None = None
+    ) -> None:
         self.settings = settings
+        self.model_id = model_id or settings.model_id
         providers = build_providers(settings)
         if settings.execution_provider == "cuda" and hasattr(ort, "preload_dlls"):
             # Load CUDA/cuDNN from the nvidia-*-cu12 pip wheels (requirements-gpu.txt)
             # so they don't need to be on LD_LIBRARY_PATH.
             ort.preload_dlls()
-        logger.info(
-            "loading model %s on %s", settings.model_id, settings.execution_provider
-        )
-        self._model = onnx_asr.load_model(settings.model_id, providers=providers)
-        self._vad = onnx_asr.load_vad("silero", providers=providers)
+        logger.info("loading model %s on %s", self.model_id, settings.execution_provider)
+        self._model = onnx_asr.load_model(self.model_id, providers=providers)
+        self._vad = vad if vad is not None else build_vad(settings)
 
         vad_options: dict[str, float] = {
             "threshold": settings.vad_threshold,

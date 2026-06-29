@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Literal
+from typing import Annotated, Literal
 
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic import field_validator
+from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 ExecutionProvider = Literal["cuda", "cpu", "coreml"]
 DiarizationDevice = Literal["cuda", "cpu"]
@@ -27,6 +28,16 @@ class Settings(BaseSettings):
     model_id: str = "istupakov/parakeet-tdt-0.6b-v3-onnx"
     execution_provider: ExecutionProvider = "cuda"
     gpu_device_id: int = 0
+
+    # Multi-model serving (optional). Empty `models` => single mode: model_id is
+    # loaded at startup and the request `model` field is ignored for routing. A
+    # non-empty allow-list => multi mode: the request model selects from the list,
+    # loaded on demand, with up to max_resident_models held in VRAM at once.
+    # NoDecode: PARASCRIBE_MODELS is comma-separated, not JSON; the validator below
+    # splits it (the default env source would otherwise try to JSON-decode a list).
+    models: Annotated[list[str], NoDecode] = []
+    max_resident_models: int = 1
+    model_ttl_s: float | None = None
 
     # Server
     host: str = "127.0.0.1"
@@ -82,6 +93,14 @@ class Settings(BaseSettings):
     # DEBUG and additionally permits transcript content into the logs.
     log_level: str = "INFO"
     debug_logging: bool = False
+
+    @field_validator("models", mode="before")
+    @classmethod
+    def _split_models(cls, value: object) -> object:
+        """Parse PARASCRIBE_MODELS as a comma-separated list (not only JSON)."""
+        if isinstance(value, str):
+            return [m.strip() for m in value.split(",") if m.strip()]
+        return value
 
     def resolved_api_key(self) -> str | None:
         """The configured bearer token, from api_key or api_key_file (or None)."""

@@ -32,6 +32,7 @@ from parascribe.formats import (
 )
 from parascribe.log import configure_logging, debug_enabled
 from parascribe.media import DecodeError, contains_video, decode_to_pcm, duration_seconds
+from parascribe.registry import ModelRegistry, UnknownModelError
 from parascribe.stitch import Transcript, assemble, offset_segment
 from parascribe.usage import build_usage
 
@@ -201,8 +202,9 @@ def create_app(
     settings: Settings | None = None,
     transcriber: Transcriber | None = None,
     diarizer: Diarizer | None = None,
+    registry: ModelRegistry | None = None,
 ) -> FastAPI:
-    """Build the app. Inject ``transcriber``/``diarizer`` in tests to skip model loads."""
+    """Build the app. Inject ``transcriber``/``registry``/``diarizer`` in tests."""
     settings = settings or Settings()
 
     @asynccontextmanager
@@ -212,7 +214,15 @@ def create_app(
         if settings.resolved_api_key() is None:
             logger.warning("No API key configured: authentication is DISABLED.")
         app.state.settings = settings
-        app.state.transcriber = transcriber or Transcriber(settings)
+        # Preload the default model so the GPU fail-loud check still fires at
+        # startup in both modes; additional allow-listed models load on demand.
+        if registry is not None:
+            app.state.registry = registry
+        elif transcriber is not None:
+            app.state.registry = ModelRegistry.seeded(settings, transcriber)
+        else:
+            app.state.registry = ModelRegistry(settings)
+            app.state.registry.preload()
         # Load the diarizer once when enabled; a load failure (missing deps/gated
         # model) fails startup loudly rather than silently disabling the feature.
         app.state.diarizer = diarizer or (
@@ -220,8 +230,9 @@ def create_app(
         )
         app.state.gate = InferenceGate(settings.max_queue)
         logger.info(
-            "ready: model=%s provider=%s diarization=%s max_queue=%d",
+            "ready: model=%s provider=%s mode=%s diarization=%s max_queue=%d",
             settings.model_id, settings.execution_provider,
+            "multi" if app.state.registry.multi else "single",
             app.state.diarizer is not None, settings.max_queue,
         )
         yield
@@ -230,13 +241,16 @@ def create_app(
 
     @app.get("/health")
     async def health(request: Request) -> JSONResponse:
-        t: Transcriber = request.app.state.transcriber
+        reg: ModelRegistry = request.app.state.registry
         return JSONResponse(
             {
                 "status": "ok",
                 "model_id": settings.model_id,
-                "device": t.device,
-                "provider_active": t.provider_active,
+                "device": reg.device,
+                "provider_active": reg.provider_active,
+                "mode": "multi" if reg.multi else "single",
+                "models": reg.allowed_ids(),
+                "loaded": reg.loaded_ids(),
             }
         )
 
@@ -246,8 +260,9 @@ def create_app(
         # `file` is the audio upload. When enable_url_fetch is on, its content may
         # instead be an http(s) URL to fetch. See fetch.py.
         file: Annotated[UploadFile, File()],
-        # Required for OpenAI compatibility; this server serves the one configured
-        # model, so the value is accepted but not used for routing.
+        # Required for OpenAI compatibility. In single mode the value is ignored
+        # (the one configured model serves every request); in multi mode it selects
+        # the model from the allow-list.
         model: Annotated[str, Form()],
         response_format: Annotated[str, Form()] = "json",
         language: Annotated[str | None, Form()] = None,
@@ -266,7 +281,7 @@ def create_app(
         authorization: Annotated[str | None, Header()] = None,
     ) -> Response:
         st: Settings = request.app.state.settings
-        transcriber: Transcriber = request.app.state.transcriber
+        registry: ModelRegistry = request.app.state.registry
         diarizer: Diarizer | None = request.app.state.diarizer
         gate: InferenceGate = request.app.state.gate
 
@@ -277,6 +292,14 @@ def create_app(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail=f"Unsupported response_format. Allowed: {list(ALLOWED_FORMATS)}",
             )
+        try:
+            # Validate the model against the allow-list up front (cheap, no GPU) so
+            # an unknown model is rejected before decoding or admission to the gate.
+            model_id = registry.resolve(model)
+        except UnknownModelError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)
+            ) from exc
         if diarization and diarizer is None:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
@@ -356,6 +379,16 @@ def create_app(
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
                 detail="Server busy: inference queue is full.",
             ) from None
+
+        # Resolve the model under the gate: a cache hit is instant, a miss loads
+        # (and may evict another model) off the event loop. Serialized with
+        # inference so a load never races an in-flight forward pass. Release the
+        # gate if the load fails so the slot is not leaked.
+        try:
+            transcriber = await run_in_threadpool(lambda: registry.get(model_id))
+        except BaseException:
+            await gate.release()
+            raise
 
         if do_stream:
             return StreamingResponse(

@@ -29,14 +29,18 @@ handling, auth, health, serialized inference. Streaming is included but
 alignment via pyannote.audio. Phase 0 already carries the **optional `speaker`
 field** (`null`) on every segment (§7); Phase 1 populates it. Opt-in per request.
 
-**Non-goals:** translation endpoint, TTS, multi-model management / model-download
-orchestration, web UI. Single model, loaded once.
+**Non-goals:** translation endpoint, TTS, request-driven model-download
+orchestration (multi-model serving is supported, but only from an explicit
+allow-list, not arbitrary downloads named by a request), web UI. Multi-model
+serving (single / swap / co-resident modes) is specified in
+`specs/multi-model-registry/spec.md`.
 
 ## 3. Hard invariants
 
 The six invariants live in `CLAUDE.md`. Summary: timestamps by default; GPU or
 fail loudly; forensic-clean logging + temp cleanup; correct offsets after
-chunking; OpenAI-compatible shapes; one model and one inference at a time.
+chunking; OpenAI-compatible shapes; one inference at a time (single or
+multi-model; see `specs/multi-model-registry/spec.md`).
 
 ## 4. Tech stack
 
@@ -202,7 +206,8 @@ Params (OpenAI-compatible):
   those exact hosts. The fetched body obeys the same `max_upload_mb` cap (→ 413).
   With `enable_url_fetch=false` a URL upload is just decoded as audio and 400s. See
   `fetch.py`.
-- `model` (required) — accepted for compatibility; one model is served.
+- `model` (required) — in single mode accepted for compatibility (one model is
+  served); in multi mode it selects the model from the allow-list (unknown -> 400).
 - `response_format` — `json` | `text` | `verbose_json` | `srt` | `vtt`.
   Default `json`. **`verbose_json` always includes segments** (invariant #1).
 - `timestamp_granularities[]` — `segment` and/or `word`. Optional refinement only;

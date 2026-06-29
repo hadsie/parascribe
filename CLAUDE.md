@@ -24,9 +24,13 @@ than guessing. After behavior-changing work, note if `SPEC.md` needs updating.
    after chunking. A wrong-but-plausible timestamp is worse than no timestamp.
 5. **OpenAI-compatible.** Response shapes match the OpenAI transcription API so
    existing clients/SDKs and LiteLLM work unmodified.
-6. **One model, one inference at a time.** Single model loaded once at startup.
-   Inference is serialized through a single-flight queue (one GPU forward pass at
-   a time); concurrent requests wait, they do not run in parallel.
+6. **One inference at a time.** Inference is serialized through a single-flight
+   queue (one GPU forward pass at a time); concurrent requests wait, they do not
+   run in parallel. Model load and eviction run under the same gate. By default a
+   single model is loaded once at startup; optional multi-model mode keeps up to
+   `max_resident_models` resident, loaded lazily and evicted LRU, with the default
+   model always preloaded at startup so the GPU check still fires. See
+   `specs/multi-model-registry/spec.md`.
 
 ## Conventions
 
