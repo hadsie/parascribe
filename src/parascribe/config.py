@@ -45,6 +45,13 @@ class Settings(BaseSettings):
     work_dir: Path = Path("/run/parascribe")
     max_upload_mb: int = 2048
     enable_video: bool = False
+    # Remote-URL input. When enabled, a file upload whose content is an http(s)
+    # URL is fetched server-side. With an empty allowlist only public addresses
+    # are reachable; a non-empty allowlist restricts to those exact hosts. See
+    # fetch.py.
+    enable_url_fetch: bool = False
+    url_fetch_allowlist: list[str] = []
+    url_fetch_timeout_s: float = 30.0
     # Max requests admitted at once (1 in-flight + the rest queued). Beyond this
     # the server returns 503.
     max_queue: int = 16

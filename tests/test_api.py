@@ -196,6 +196,64 @@ class TestStreaming:
             assert r.text.startswith("1\n00:00:00,000 -->")
 
 
+class TestUrlInput:
+    """URL input rides in as the file upload's content (file-content convention)."""
+
+    def _post_url(self, client, url_str, *, key="secret"):
+        headers = {"Authorization": f"Bearer {key}"} if key else {}
+        return client.post(
+            "/v1/audio/transcriptions",
+            files={"file": ("source.url", url_str.encode(), "text/plain")},
+            data={"model": "parascribe"},
+            headers=headers,
+        )
+
+    def test_url_content_treated_as_audio_when_disabled(self, tmp_path):
+        # enable_url_fetch off: the URL text is decoded as audio and fails -> 400.
+        with make_client(tmp_path) as client:
+            assert self._post_url(client, "https://example.com/a.wav").status_code == 400
+
+    def test_real_audio_not_misdetected_as_url(self, tmp_path, wav):
+        # Regression: a genuine upload still transcribes with fetching enabled.
+        with make_client(tmp_path, enable_url_fetch=True) as client:
+            r = post(client, wav)
+            assert r.status_code == 200
+            assert r.json()["text"] == "The first part. The second part."
+
+    def test_url_content_transcribes(self, tmp_path, wav, monkeypatch):
+        audio_bytes = wav.read_bytes()
+
+        def fake_fetch(url, dest, *, max_bytes, timeout, allowlist):
+            assert url == "https://example.com/a.wav"
+            dest.write_bytes(audio_bytes)
+
+        monkeypatch.setattr("parascribe.main.fetch_to_file", fake_fetch)
+        with make_client(tmp_path, enable_url_fetch=True) as client:
+            r = self._post_url(client, "https://example.com/a.wav")
+            assert r.status_code == 200
+            assert r.json()["text"] == "The first part. The second part."
+
+    def test_fetch_error_is_400(self, tmp_path, monkeypatch):
+        from parascribe.fetch import FetchError
+
+        def boom(*a, **k):
+            raise FetchError("URL resolves to a disallowed (internal) address")
+
+        monkeypatch.setattr("parascribe.main.fetch_to_file", boom)
+        with make_client(tmp_path, enable_url_fetch=True) as client:
+            assert self._post_url(client, "https://10.0.0.1/a.wav").status_code == 400
+
+    def test_oversize_fetch_is_413(self, tmp_path, monkeypatch):
+        from parascribe.fetch import FetchTooLargeError
+
+        def boom(*a, **k):
+            raise FetchTooLargeError("fetched body exceeds max_upload_mb")
+
+        monkeypatch.setattr("parascribe.main.fetch_to_file", boom)
+        with make_client(tmp_path, enable_url_fetch=True) as client:
+            assert self._post_url(client, "https://example.com/big.wav").status_code == 413
+
+
 class TestVideoGating:
     def test_video_rejected_when_disabled(self, tmp_path, video):
         with make_client(tmp_path) as client:  # enable_video defaults False

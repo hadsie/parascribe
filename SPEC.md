@@ -188,7 +188,20 @@ the summed speech regions.
 ### `POST /v1/audio/transcriptions` (multipart/form-data)
 
 Params (OpenAI-compatible):
-- `file` (required) — audio (or video, if `enable_video`).
+- `file` (required) — audio (or video, if `enable_video`). **URL input
+  (parascribe extension):** when `enable_url_fetch=true`, if the uploaded content
+  is itself a single `http`/`https` URL (under 2 KB, no internal whitespace), the
+  server fetches that URL instead of decoding the bytes as audio. The URL must
+  ride as the *file content* — not a separate field — because OpenAI has no URL
+  param and a fronting LiteLLM gateway drops non-standard form fields, whereas it
+  forwards `file` bytes intact. Detection cannot misfire on real media (it has
+  sub-0x20 bytes; a URL is clean ASCII). Fetching is an SSRF surface: only
+  `http`/`https`, redirects are not followed, and with an empty
+  `url_fetch_allowlist` every resolved address must be public
+  (private/loopback/link-local/metadata → 400); a non-empty allowlist restricts to
+  those exact hosts. The fetched body obeys the same `max_upload_mb` cap (→ 413).
+  With `enable_url_fetch=false` a URL upload is just decoded as audio and 400s. See
+  `fetch.py`.
 - `model` (required) — accepted for compatibility; one model is served.
 - `response_format` — `json` | `text` | `verbose_json` | `srt` | `vtt`.
   Default `json`. **`verbose_json` always includes segments** (invariant #1).

@@ -79,6 +79,9 @@ All settings are environment variables prefixed `PARASCRIBE_` (see `.env.example
 | `MAX_UPLOAD_MB` | `2048` | Max *upload* size; larger returns 413. Note: the upload is decoded fully into RAM as a 16 kHz float32 array (~115 MB/hour), so peak memory tracks decoded duration, not upload bytes — a small compressed file can expand to GBs. |
 | `MAX_QUEUE` | `16` | Max admitted requests (1 in-flight + queued); beyond this returns 503. |
 | `ENABLE_VIDEO` | `false` | Accept video input (extract audio track). |
+| `ENABLE_URL_FETCH` | `false` | Fetch the input server-side when the upload's content is an http(s) URL (SSRF surface; see [URL input](#post-v1audiotranscriptions-multipartform-data)). |
+| `URL_FETCH_ALLOWLIST` | (empty) | Exact hosts allowed for URL fetches (e.g. `["media.example.com"]`). Empty = any public host (private/internal addresses always refused). |
+| `URL_FETCH_TIMEOUT_S` | `30` | Per-request timeout for a URL fetch. |
 | `DEFAULT_LANGUAGE` | (none) | ISO language hint. Accepted but IGNORED by Parakeet TDT (auto-detects); only Whisper/Canary use it. |
 | `ENABLE_DIARIZATION` | `false` | Load the diarizer at startup (needs `requirements-diarization.txt`). See [Diarization](#diarization-optional). |
 | `DIARIZATION_MODEL` | `pyannote/speaker-diarization-3.1` | pyannote pipeline (gated model). |
@@ -98,9 +101,9 @@ All settings are environment variables prefixed `PARASCRIBE_` (see `.env.example
 
 ### `POST /v1/audio/transcriptions` (multipart/form-data)
 
-Standard OpenAI params: `file` (required), `model` (required, accepted for
-compatibility), `response_format`, `timestamp_granularities[]`, `language`,
-`stream`, `temperature`, `prompt`. `temperature`/`prompt` are accepted and
+Standard OpenAI params: `file` (required), `model`
+(accepted for compatibility), `response_format`, `timestamp_granularities[]`,
+`language`, `stream`, `temperature`, `prompt`. `temperature`/`prompt` are accepted and
 ignored (logged) since the backend does not use them. `language` is likewise
 accepted but ignored by Parakeet TDT (it auto-detects); it would only take effect
 with a Whisper/Canary backend. Note the `language` field in the **response** is
@@ -131,7 +134,36 @@ curl -N http://127.0.0.1:8000/v1/audio/transcriptions \
   -H "Authorization: Bearer your-secret" \
   -F file=@two-hour-recording.wav -F model=parascribe \
   -F response_format=verbose_json -F stream=true
+
+# fetch from a URL instead of uploading: the URL IS the file content (see below)
+printf 'https://media.example.com/meeting.mp3' | \
+  curl -s http://127.0.0.1:8000/v1/audio/transcriptions \
+  -H "Authorization: Bearer your-secret" \
+  -F 'file=@-;filename=source.url' -F model=parascribe
 ```
+
+**URL input (parascribe extension).** When
+`PARASCRIBE_ENABLE_URL_FETCH=true`, you can make the server fetch the audio
+itself by uploading a single `http`/`https` URL *as the file content* (rather
+than the audio bytes). It rides in the `file` field rather than a dedicated
+`url` field on purpose: OpenAI's API has no URL param and a fronting LiteLLM
+gateway drops any non-standard form field, but it forwards `file` bytes intact,
+so this is the one form that survives the gateway. From the OpenAI SDK:
+
+```python
+client.audio.transcriptions.create(
+    model="parascribe",
+    file=("source.url", b"https://media.example.com/meeting.mp3"),
+)
+```
+
+Detection never misfires on real media (audio has sub-0x20 bytes; a URL is
+clean ASCII). Fetching is a server-side request forgery surface, hence **off by
+default**. Only `http`/`https` are allowed and redirects are not followed. With
+an empty allowlist the server resolves the host and refuses
+private/loopback/link-local/metadata addresses; for an exposed deployment set
+`PARASCRIBE_URL_FETCH_ALLOWLIST` to the exact hosts you trust (e.g.
+`["media.example.com"]`). The fetched body obeys the same `max_upload_mb` cap.
 
 Streaming emits OpenAI `transcript.text.delta` events as each segment finalizes,
 then a terminal `transcript.text.done`. For `verbose_json` the done event also

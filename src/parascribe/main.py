@@ -21,6 +21,7 @@ from parascribe.asr import RawSegment, Transcriber
 from parascribe.auth import check_bearer
 from parascribe.config import Settings
 from parascribe.diarize import Diarizer
+from parascribe.fetch import FetchError, FetchTooLargeError, fetch_to_file, looks_like_url
 from parascribe.formats import (
     ALLOWED_FORMATS,
     STREAMABLE_FORMATS,
@@ -167,17 +168,33 @@ async def _stream_events(
         await gate.release()
 
 
-async def _save_upload(upload: UploadFile, dest: Path, max_bytes: int) -> None:
+async def _save_upload(
+    upload: UploadFile, dest: Path, max_bytes: int, *, fetch_enabled: bool
+) -> str | None:
+    """Stream the upload to ``dest`` (size-capped), or return a URL to fetch.
+
+    When ``fetch_enabled`` and the entire upload is a single http(s) URL, nothing
+    is written and the URL is returned for the caller to fetch. Otherwise the
+    bytes are the audio.
+    """
+    first = await upload.read(_UPLOAD_CHUNK)
+    # A URL fits in one read; only attempt detection when the first read reached
+    # EOF (a larger upload spans multiple reads).
+    if fetch_enabled and len(first) < _UPLOAD_CHUNK:
+        url = looks_like_url(first)
+        if url is not None:
+            return url
+
     size = 0
+    chunk = first
     with dest.open("wb") as handle:
-        while chunk := await upload.read(_UPLOAD_CHUNK):
+        while chunk:
             size += len(chunk)
             if size > max_bytes:
-                raise HTTPException(
-                    status_code=413,
-                    detail="Upload exceeds max_upload_mb.",
-                )
+                raise HTTPException(status_code=413, detail="Upload exceeds max_upload_mb.")
             handle.write(chunk)
+            chunk = await upload.read(_UPLOAD_CHUNK)
+    return None
 
 
 def create_app(
@@ -226,6 +243,8 @@ def create_app(
     @app.post("/v1/audio/transcriptions")
     async def create_transcription(
         request: Request,
+        # `file` is the audio upload. When enable_url_fetch is on, its content may
+        # instead be an http(s) URL to fetch. See fetch.py.
         file: Annotated[UploadFile, File()],
         # Required for OpenAI compatibility; this server serves the one configured
         # model, so the value is accepted but not used for routing.
@@ -294,17 +313,29 @@ def create_app(
         # Decode fully into memory, then drop the upload immediately: streaming and
         # non-streaming alike work from the in-memory array, so the temp file never
         # outlives decode (keeps uploaded media off disk beyond the request).
+        max_bytes = st.max_upload_mb * 1024 * 1024
         decode_start = time.monotonic()
         try:
-            await _save_upload(file, tmp_path, st.max_upload_mb * 1024 * 1024)
+            source_url = await _save_upload(
+                file, tmp_path, max_bytes, fetch_enabled=st.enable_url_fetch
+            )
+            if source_url is not None:
+                logger.debug("input is a remote URL; fetching", extra=log)
+                await run_in_threadpool(
+                    fetch_to_file, source_url, tmp_path,
+                    max_bytes=max_bytes, timeout=st.url_fetch_timeout_s,
+                    allowlist=st.url_fetch_allowlist,
+                )
             if not st.enable_video and await run_in_threadpool(contains_video, tmp_path):
                 raise HTTPException(
                     status_code=status.HTTP_400_BAD_REQUEST,
                     detail="Video input is disabled (set enable_video=true).",
                 )
             audio = await run_in_threadpool(decode_to_pcm, tmp_path)
-        except DecodeError as exc:
-            logger.warning("decode failed: %s", exc, extra=log)
+        except FetchTooLargeError as exc:
+            raise HTTPException(status_code=413, detail=str(exc)) from exc
+        except (FetchError, DecodeError) as exc:
+            logger.warning("input failed: %s", exc, extra=log)
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)
             ) from exc
