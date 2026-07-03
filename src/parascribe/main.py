@@ -416,12 +416,16 @@ def create_app(
                     max_bytes=max_bytes, timeout=st.url_fetch_timeout_s,
                     allowlist=st.url_fetch_allowlist,
                 )
-            if not st.enable_video and await run_in_threadpool(contains_video, tmp_path):
+            if not st.enable_video and await run_in_threadpool(
+                lambda: contains_video(tmp_path, timeout_s=st.decode_timeout_s)
+            ):
                 raise HTTPException(
                     status_code=status.HTTP_400_BAD_REQUEST,
                     detail="Video input is disabled (set enable_video=true).",
                 )
-            audio = await run_in_threadpool(decode_to_pcm, tmp_path)
+            audio = await run_in_threadpool(
+                lambda: decode_to_pcm(tmp_path, timeout_s=st.decode_timeout_s)
+            )
         except FetchTooLargeError as exc:
             raise HTTPException(status_code=413, detail=str(exc)) from exc
         except (FetchError, DecodeError) as exc:

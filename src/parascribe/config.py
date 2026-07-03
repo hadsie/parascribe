@@ -55,6 +55,9 @@ class Settings(BaseSettings):
     # Limits / IO
     work_dir: Path = Path("/run/parascribe")
     max_upload_mb: int = 2048
+    # Kill ffmpeg/ffprobe on input that hangs the decoder (maps to 400). Bounds
+    # only the decode subprocess, never transcription/diarization time.
+    decode_timeout_s: float = 300.0
     enable_video: bool = False
     # Remote-URL input. When enabled, a file upload whose content is an http(s)
     # URL is fetched server-side. With an empty allowlist only public addresses
