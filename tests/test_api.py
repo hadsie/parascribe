@@ -427,6 +427,141 @@ class TestDiarization:
             assert r.json()["segments"][0]["speaker"] == "SPEAKER_00"
 
 
+@pytest.fixture
+def parascribe_log(caplog):
+    """Capture the parascribe logger (no root propagation).
+
+    configure_logging clears the logger's handlers at app startup, so tests must
+    call ``attach()`` after entering the TestClient context, then read records
+    off the fixture.
+    """
+    logger = logging.getLogger("parascribe")
+
+    class Capture:
+        @property
+        def records(self):
+            return caplog.records
+
+        @staticmethod
+        def attach() -> None:
+            logger.addHandler(caplog.handler)
+
+    try:
+        yield Capture()
+    finally:
+        logger.removeHandler(caplog.handler)
+
+
+class TestForensicCleanliness:
+    """Invariant: no transcript text, filenames, or URLs in logs at INFO."""
+
+    def _log_blob(self, caplog) -> str:
+        return " ".join(r.getMessage() for r in caplog.records)
+
+    def test_no_content_or_filename_in_logs_at_info(self, tmp_path, wav, parascribe_log):
+        with make_client(tmp_path) as client:
+            parascribe_log.attach()
+            post(client, wav, response_format="verbose_json")
+        blob = self._log_blob(parascribe_log)
+        assert "done:" in blob  # capture sanity: operational line was logged
+        assert "first part" not in blob.lower()  # transcript content
+        assert "clip.wav" not in blob  # original filename
+
+    def test_url_never_logged_even_on_fetch_failure(self, tmp_path, parascribe_log, monkeypatch):
+        from parascribe.fetch import FetchError
+
+        def boom(*a, **k):
+            raise FetchError("could not fetch URL")
+
+        monkeypatch.setattr("parascribe.main.fetch_to_file", boom)
+        with make_client(tmp_path, enable_url_fetch=True) as client:
+            parascribe_log.attach()
+            client.post(
+                "/v1/audio/transcriptions",
+                files={"file": ("s.url", b"https://secret-host.example.com/a.wav", "text/plain")},
+                data={"model": "parascribe"},
+                headers={"Authorization": "Bearer secret"},
+            )
+        assert "secret-host.example.com" not in self._log_blob(parascribe_log)
+
+    def test_debug_logging_gates_transcript_content(self, tmp_path, wav, parascribe_log):
+        # Off (default): content stays out even of DEBUG-capable capture.
+        with make_client(tmp_path) as client:
+            parascribe_log.attach()
+            post(client, wav)
+        assert "first part" not in self._log_blob(parascribe_log).lower()
+
+    def test_debug_logging_exposes_content_when_enabled(self, tmp_path, wav, parascribe_log):
+        with make_client(tmp_path, debug_logging=True) as client:
+            parascribe_log.attach()
+            post(client, wav)
+        assert "first part" in self._log_blob(parascribe_log).lower()
+
+
+class TestUploadCleanup:
+    """Invariant: the upload temp file is deleted on every path."""
+
+    def _workdir_entries(self, tmp_path) -> list:
+        return list((tmp_path / "work").iterdir())
+
+    def test_removed_after_success(self, tmp_path, wav):
+        with make_client(tmp_path) as client:
+            assert post(client, wav).status_code == 200
+            assert self._workdir_entries(tmp_path) == []
+
+    def test_removed_after_decode_error(self, tmp_path):
+        with make_client(tmp_path) as client:
+            r = client.post(
+                "/v1/audio/transcriptions",
+                files={"file": ("junk.bin", b"not audio at all" * 100, "audio/wav")},
+                data={"model": "parascribe"},
+                headers={"Authorization": "Bearer secret"},
+            )
+            assert r.status_code == 400
+            assert self._workdir_entries(tmp_path) == []
+
+    def test_removed_after_413(self, tmp_path, wav):
+        with make_client(tmp_path, max_upload_mb=0) as client:
+            assert post(client, wav).status_code == 413
+            assert self._workdir_entries(tmp_path) == []
+
+    def test_removed_after_video_rejection(self, tmp_path, video):
+        with make_client(tmp_path) as client:  # enable_video defaults False
+            assert post(client, video).status_code == 400
+            assert self._workdir_entries(tmp_path) == []
+
+
+class TestGateSadPaths:
+    def test_saturated_gate_returns_503_envelope(self, tmp_path, wav, monkeypatch):
+        async def full(self):
+            raise QueueFullError
+
+        monkeypatch.setattr("parascribe.main.InferenceGate.acquire", full)
+        with make_client(tmp_path) as client:
+            r = post(client, wav)
+            assert r.status_code == 503
+            assert r.json()["error"]["type"] == "server_error"
+
+    def test_gate_released_when_model_load_fails(self, tmp_path, wav):
+        settings = Settings(
+            execution_provider="cpu", work_dir=tmp_path / "work",
+            api_key="secret", models=["good", "bad"],
+        )
+
+        def factory(model_id):
+            if model_id == "bad":
+                raise RuntimeError("model load failed")
+            return FakeTranscriber()
+
+        registry = ModelRegistry(settings, factory=factory)
+        registry.preload()
+        app = create_app(settings=settings, registry=registry)
+        with TestClient(app, raise_server_exceptions=False) as client:
+            assert post(client, wav, model="bad").status_code == 500
+            # The slot came back: a follow-up request must not hang or 503.
+            assert post(client, wav, model="good").status_code == 200
+
+
 class TestInferenceGate:
     async def test_rejects_beyond_capacity(self):
         gate = InferenceGate(capacity=1)
