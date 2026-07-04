@@ -90,17 +90,32 @@ def _group_words(tokens: list[str], global_ts: list[float], seg_end: float) -> l
     return words
 
 
-def offset_segment(seg_id: int, raw: RawSegment) -> tuple[Segment, list[Word]]:
-    """Convert one VAD ``RawSegment`` into a global-timed ``Segment`` plus words."""
-    global_ts = [raw.start + t for t in raw.timestamps]
-    words = _group_words(raw.tokens, global_ts, raw.end)
+def _clamp(t: float, max_end: float | None) -> float:
+    t = max(t, 0.0)
+    return t if max_end is None else min(t, max_end)
+
+
+def offset_segment(
+    seg_id: int, raw: RawSegment, *, max_end: float | None = None
+) -> tuple[Segment, list[Word]]:
+    """Convert one VAD ``RawSegment`` into a global-timed ``Segment`` plus words.
+
+    ``max_end`` bounds every emitted time to the audio's real extent: VAD
+    boundary padding (``speech_pad_ms``, from ``chunk_overlap_s``) can push a
+    segment's window before 0 or past the file's end, and those artifacts must
+    not become plausible-looking timestamps.
+    """
+    start = _clamp(raw.start, max_end)
+    end = _clamp(raw.end, max_end)
+    global_ts = [_clamp(raw.start + t, max_end) for t in raw.timestamps]
+    words = _group_words(raw.tokens, global_ts, end)
     avg_logprob = (
         round(sum(raw.logprobs) / len(raw.logprobs), 4) if raw.logprobs else None
     )
     segment = Segment(
         id=seg_id,
-        start=round(raw.start, _PRECISION),
-        end=round(raw.end, _PRECISION),
+        start=round(start, _PRECISION),
+        end=round(end, _PRECISION),
         text=raw.text.strip(),
         speaker=None,
         avg_logprob=avg_logprob,
@@ -124,7 +139,7 @@ def assemble(
     for raw in raw_segments:
         if not raw.text.strip():
             continue
-        segment, seg_words = offset_segment(next_id, raw)
+        segment, seg_words = offset_segment(next_id, raw, max_end=duration)
         next_id += 1
         segments.append(segment)
         words.extend(seg_words)

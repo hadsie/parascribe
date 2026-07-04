@@ -47,7 +47,10 @@ class Settings(BaseSettings):
     api_key: str | None = None
     api_key_file: Path | None = None
 
-    # Chunking / VAD (mapped to onnx-asr VadOptions)
+    # Chunking / VAD (mapped to onnx-asr VadOptions). chunk_overlap_s maps to
+    # silero speech_pad_ms: it pads VAD segment boundaries, it does NOT create
+    # deduplicated overlap -- padded audio at a seam may be transcribed in both
+    # neighboring segments. Emitted timestamps are clamped to [0, duration].
     max_chunk_s: float = 24.0
     chunk_overlap_s: float = 0.0
     vad_threshold: float = 0.5

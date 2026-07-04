@@ -48,10 +48,12 @@ class FakeDiarizer:
 
 @pytest.fixture
 def wav(tmp_path: Path) -> Path:
+    # 6s so the CANNED segment times (up to 6.0) fit inside the real duration;
+    # emitted timestamps are clamped to the decoded audio's extent.
     out = tmp_path / "clip.wav"
     subprocess.run(
         ["ffmpeg", "-v", "error", "-f", "lavfi",
-         "-i", "sine=frequency=300:duration=1:sample_rate=16000", str(out), "-y"],
+         "-i", "sine=frequency=300:duration=6:sample_rate=16000", str(out), "-y"],
         check=True,
     )
     return out
@@ -133,8 +135,8 @@ class TestResponseFormats:
             assert body["text"] == "The first part. The second part."
             # 2 canned segments * 4 subword tokens, billed 1:1, no diarization.
             assert body["usage"]["output_tokens"] == 8
-            # Audio input: 1s wav * 10 (OpenAI-parity default) -> input_tokens.
-            assert body["usage"]["input_tokens"] == 10
+            # Audio input: 6s wav * 10 (OpenAI-parity default) -> input_tokens.
+            assert body["usage"]["input_tokens"] == 60
 
     def test_verbose_json_has_segments_without_granularities(self, tmp_path, wav):
         # Invariant #1: segments + real times without timestamp_granularities[].

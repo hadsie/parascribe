@@ -87,6 +87,28 @@ class TestOffsetSegment:
         assert words == []
         assert seg.text == "x"
 
+    def test_padded_end_is_clamped_to_max_end(self):
+        # VAD padding (chunk_overlap_s -> speech_pad_ms) can push a segment's
+        # window past the file's end; the artifact must not become a timestamp.
+        seg, words = offset_segment(
+            0, raw(9.0, 10.6, "tail word", [" tail", " word"], [0.0, 1.5]),
+            max_end=10.0,
+        )
+        assert seg.end == 10.0
+        assert words[-1].end == 10.0
+        assert words[-1].start == 10.0  # 9.0 + 1.5 clamped to the file's extent
+
+    def test_negative_padded_start_is_clamped_to_zero(self):
+        seg, words = offset_segment(
+            0, raw(-0.2, 1.0, "head", [" head"], [0.0]), max_end=10.0
+        )
+        assert seg.start == 0.0
+        assert words[0].start == 0.0
+
+    def test_no_clamp_without_max_end(self):
+        seg, _ = offset_segment(0, raw(9.0, 10.6, "x", [" x"], [0.0]))
+        assert seg.end == 10.6
+
     def test_mismatched_token_timestamp_lengths_raise(self):
         with pytest.raises(ValueError, match="length mismatch"):
             offset_segment(0, raw(0.0, 1.0, "x", [" a", " b", " c"], [0.0, 0.5]))
@@ -143,6 +165,13 @@ class TestAssemble:
         ]
         t = assemble(segs, language="en", duration=3.0)
         assert t.token_count == 4  # only the two kept segments' tokens
+
+    def test_assemble_clamps_segment_times_to_duration(self):
+        t = assemble(
+            [raw(9.0, 10.6, "tail", [" tail"], [0.0])], language=None, duration=10.0
+        )
+        assert t.segments[0].end == 10.0
+        assert t.words[-1].end == 10.0
 
     def test_empty_text_segments_are_dropped_with_contiguous_ids(self):
         segs = [

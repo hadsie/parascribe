@@ -178,7 +178,7 @@ async def _stream_events(
             assert isinstance(item, RawSegment)
             if not item.text.strip():
                 continue  # drop VAD regions with no recognized speech (matches assemble)
-            segment, seg_words = offset_segment(seg_id, item)
+            segment, seg_words = offset_segment(seg_id, item, max_end=duration)
             seg_id += 1
             segments.append(segment)
             words.extend(seg_words)
