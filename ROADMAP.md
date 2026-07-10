@@ -1,26 +1,22 @@
 # Roadmap
 
-Post-MVP ideas, not committed work. The current design is **one model per
-instance, one inference at a time**, fronted by a LiteLLM gateway; several items
-below would extend or relax that, and each notes the constraint that makes it
-non-trivial.
+Post-MVP ideas, not committed work. The current design is **one inference at a
+time** (single model by default, or an optional multi-model allow-list — see
+`specs/multi-model-registry/spec.md`), fronted by a LiteLLM gateway; several
+items below would extend or relax that, and each notes the constraint that makes
+it non-trivial.
 
 ## Concurrency & scheduling
 
-### Serve multiple models (swap in/out)
-Run more than one model (e.g. Parakeet `v2` English + `v3` multilingual) from one
-deployment, routed by the OpenAI `model` param (today accepted but unused).
-Approaches, in rough order of effort:
-- **LiteLLM fleet** — multiple single-model instances, gateway routes by name.
-  Zero server code; the design's intended path.
-- **In-process, both resident** — load N models, route by `model`. Cleanest API.
-  VRAM cost: two Parakeets ≈ 10-11GB (fine on a 24GB card, tight on the 11GB
-  1080 Ti).
-- **In-process, lazy load + LRU swap** — one resident, reload on model switch
-  (~seconds). Fits small VRAM; adds swap latency when callers alternate.
-
-The binding constraint is VRAM on the production card; that likely forces
-lazy-swap or single-model-per-deploy there.
+### Serve multiple models — shipped
+Implemented in `registry.py` (see `specs/multi-model-registry/spec.md`): the
+OpenAI `model` param routes against a configured allow-list, with both
+co-resident (`max_resident_models > 1`) and lazy-load + LRU-swap modes, plus an
+optional idle TTL. A **LiteLLM fleet** (multiple single-model instances, gateway
+routes by name) remains the zero-server-code alternative. VRAM on the production
+card is still the binding constraint: two Parakeets ≈ 10-11GB (fine on a 24GB
+card, tight on the 11GB 1080 Ti), which favors swap mode there. The open
+validation work is tracked under "Validated multi-model support" below.
 
 ### Richer request queuing
 Today the inference gate serializes to one in-flight call and admits up to
@@ -42,7 +38,8 @@ care: still one GPU forward pass at a time, and bounded total work.
 ## Diarization
 
 ### GPU diarization
-CPU pyannote is slow (~0.4× realtime; ~47 min for a 2h file). Two routes to GPU:
+CPU pyannote is slow (~0.4x the audio duration; ~47 min for a 2h file). Two
+routes to GPU:
 - **Sortformer-ONNX** — NVIDIA's end-to-end diarizer runs on our existing
   onnxruntime stack (no torch, GPU even on Pascal). Deferred because it needs a
   hand-port of NVIDIA's streaming Arrival-Order-Speaker-Cache loop; see

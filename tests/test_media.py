@@ -8,7 +8,7 @@ from pathlib import Path
 import pytest
 
 from parascribe.asr import SAMPLE_RATE
-from parascribe.media import DecodeError, decode_to_pcm, duration_seconds
+from parascribe.media import DecodeError, contains_video, decode_to_pcm, duration_seconds
 
 
 @pytest.fixture
@@ -45,3 +45,23 @@ class TestDecodeToPcm:
     def test_missing_file_raises_decode_error(self, tmp_path: Path):
         with pytest.raises(DecodeError):
             decode_to_pcm(tmp_path / "does-not-exist.wav")
+
+
+class TestDecodeTimeout:
+    """A hung ffmpeg/ffprobe must become a clean DecodeError, not a stuck thread."""
+
+    def _hang(self, monkeypatch):
+        def fake_run(cmd, **kwargs):
+            raise subprocess.TimeoutExpired(cmd, kwargs["timeout"])
+
+        monkeypatch.setattr("parascribe.media.subprocess.run", fake_run)
+
+    def test_decode_timeout_raises_decode_error(self, monkeypatch, tmp_path: Path):
+        self._hang(monkeypatch)
+        with pytest.raises(DecodeError, match="in time"):
+            decode_to_pcm(tmp_path / "hang.wav", timeout_s=0.1)
+
+    def test_probe_timeout_raises_decode_error(self, monkeypatch, tmp_path: Path):
+        self._hang(monkeypatch)
+        with pytest.raises(DecodeError, match="in time"):
+            contains_video(tmp_path / "hang.mp4", timeout_s=0.1)

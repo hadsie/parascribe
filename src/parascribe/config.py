@@ -47,7 +47,10 @@ class Settings(BaseSettings):
     api_key: str | None = None
     api_key_file: Path | None = None
 
-    # Chunking / VAD (mapped to onnx-asr VadOptions)
+    # Chunking / VAD (mapped to onnx-asr VadOptions). chunk_overlap_s maps to
+    # silero speech_pad_ms: it pads VAD segment boundaries, it does NOT create
+    # deduplicated overlap -- padded audio at a seam may be transcribed in both
+    # neighboring segments. Emitted timestamps are clamped to [0, duration].
     max_chunk_s: float = 24.0
     chunk_overlap_s: float = 0.0
     vad_threshold: float = 0.5
@@ -55,6 +58,9 @@ class Settings(BaseSettings):
     # Limits / IO
     work_dir: Path = Path("/run/parascribe")
     max_upload_mb: int = 2048
+    # Kill ffmpeg/ffprobe on input that hangs the decoder (maps to 400). Bounds
+    # only the decode subprocess, never transcription/diarization time.
+    decode_timeout_s: float = 300.0
     enable_video: bool = False
     # Remote-URL input. When enabled, a file upload whose content is an http(s)
     # URL is fetched server-side. With an empty allowlist only public addresses
@@ -103,20 +109,29 @@ class Settings(BaseSettings):
         return value
 
     def resolved_api_key(self) -> str | None:
-        """The configured bearer token, from api_key or api_key_file (or None)."""
-        return self._read_secret(self.api_key, self.api_key_file)
+        """The configured bearer token, from api_key or api_key_file (or None).
+
+        Raises if api_key_file is set but unreadable: a typo'd path must fail
+        the server loudly, not silently disable authentication.
+        """
+        return self._read_secret(self.api_key, self.api_key_file, name="api_key_file")
 
     def resolved_hf_token(self) -> str | None:
         """HuggingFace token for the (one-time, gated) diarization model download."""
-        return self._read_secret(self.hf_token, self.hf_token_file)
+        return self._read_secret(self.hf_token, self.hf_token_file, name="hf_token_file")
 
     @staticmethod
-    def _read_secret(value: str | None, path: Path | None) -> str | None:
+    def _read_secret(value: str | None, path: Path | None, *, name: str) -> str | None:
         if value:
             return value
-        if path is not None and path.exists():
-            return path.read_text(encoding="utf-8").strip() or None
-        return None
+        if path is None:
+            return None
+        if not path.exists():
+            raise ValueError(f"{name} points to a missing file: {path}")
+        secret = path.read_text(encoding="utf-8").strip()
+        if not secret:
+            raise ValueError(f"{name} points to an empty file: {path}")
+        return secret
 
     @property
     def resolved_diarization_device(self) -> DiarizationDevice:

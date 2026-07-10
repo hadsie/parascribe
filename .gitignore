@@ -8,3 +8,5 @@ __pycache__/
 scratchpad/
 *.egg-info/
 .env
+.claude/reviews/*
+.claude/settings.local.json

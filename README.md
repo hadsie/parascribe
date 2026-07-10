@@ -12,9 +12,11 @@ with word- and segment-level timestamps, running on your own GPU.
 - Runs on your GPU / CUDA.
 - Output formats include `json`, `text`, `verbose_json`, `srt`, `vtt`.
 - Streaming support (`stream=true`).
+- Optional multi-model serving from one process (see
+  [Multiple models](#multiple-models-optional)).
 - Optional audio extraction from video (enable with `ENABLE_VIDEO`).
 - Optional speaker diarization (see [Diarization](#diarization-optional)).
-- Bearer-token auth and a `/health` endpoint.
+- Bearer-token auth, a `/health` endpoint, and OpenAI-style `/v1/models`.
 
 ## Requirements
 
@@ -68,15 +70,19 @@ All settings are environment variables prefixed `PARASCRIBE_` (see `.env.example
 | Variable | Default | Description |
 | --- | --- | --- |
 | `MODEL_ID` | `istupakov/parakeet-tdt-0.6b-v3-onnx` | onnx-asr model id (HF repo or builtin alias). |
+| `MODELS` | (empty) | Comma-separated model allow-list. Empty = single-model mode; non-empty enables multi-model routing by the request `model` (see [Multiple models](#multiple-models-optional)). |
+| `MAX_RESIDENT_MODELS` | `1` | Multi-model: max models held in VRAM at once. `1` = swap on switch; higher keeps models co-resident. |
+| `MODEL_TTL_S` | (none) | Multi-model: evict a model idle this many seconds (unset = evict only on capacity pressure). |
 | `EXECUTION_PROVIDER` | `cuda` | `cuda` \| `cpu` \| `coreml`. `cuda` fails loudly if not engaged. |
 | `GPU_DEVICE_ID` | `0` | CUDA device index. |
 | `HOST` / `PORT` | `127.0.0.1` / `8000` | Bind address. |
-| `API_KEY` / `API_KEY_FILE` | (none) | Bearer token (inline or file). If unset, auth is disabled with a loud warning. |
+| `API_KEY` / `API_KEY_FILE` | (none) | Bearer token (inline or file). If unset, auth is disabled with a loud warning. A key *file* that is missing or empty fails startup (never a silently open server). |
 | `WORK_DIR` | `/run/parascribe` | tmpfs dir for temp uploads (deleted after each request). |
 | `MAX_CHUNK_S` | `24` | Max VAD speech-segment length (onnx-asr `max_speech_duration_s`). |
-| `CHUNK_OVERLAP_S` | `0` | VAD pad (onnx-asr `speech_pad_ms`). 0 = cut cleanly at silence. |
+| `CHUNK_OVERLAP_S` | `0` | VAD boundary pad (onnx-asr `speech_pad_ms`), NOT deduplicated overlap: padded audio at a seam may be transcribed in both neighboring segments. 0 = cut cleanly at silence. Timestamps are always clamped to the file's real extent. |
 | `VAD_THRESHOLD` | `0.5` | Silero VAD threshold. |
 | `MAX_UPLOAD_MB` | `2048` | Max *upload* size; larger returns 413. Note: the upload is decoded fully into RAM as a 16 kHz float32 array (~115 MB/hour), so peak memory tracks decoded duration, not upload bytes — a small compressed file can expand to GBs. |
+| `DECODE_TIMEOUT_S` | `300` | Kill ffmpeg/ffprobe past this (hung/pathological input → 400). Bounds only the decode subprocess; transcription/diarization are never timed. |
 | `MAX_QUEUE` | `16` | Max admitted requests (1 in-flight + queued); beyond this returns 503. |
 | `ENABLE_VIDEO` | `false` | Accept video input (extract audio track). |
 | `ENABLE_URL_FETCH` | `false` | Fetch the input server-side when the upload's content is an http(s) URL (SSRF surface; see [URL input](#post-v1audiotranscriptions-multipartform-data)). |
@@ -101,8 +107,9 @@ All settings are environment variables prefixed `PARASCRIBE_` (see `.env.example
 
 ### `POST /v1/audio/transcriptions` (multipart/form-data)
 
-Standard OpenAI params: `file` (required), `model`
-(accepted for compatibility), `response_format`, `timestamp_granularities[]`,
+Standard OpenAI params: `file` (required), `model` (required; ignored for
+routing in single-model mode, selects from the allow-list in multi-model mode —
+unknown model returns 400), `response_format`, `timestamp_granularities[]`,
 `language`, `stream`, `temperature`, `prompt`. `temperature`/`prompt` are accepted and
 ignored (logged) since the backend does not use them. `language` is likewise
 accepted but ignored by Parakeet TDT (it auto-detects); it would only take effect
@@ -173,8 +180,26 @@ not realtime input (the file is decoded and VAD-segmented first). `stream=true`
 with `srt`/`vtt`/`text` is ignored (logged) and returns the normal response.
 
 If transcription fails mid-stream, the SSE stream ends **without** a
-`transcript.text.done` event (the server logs the error); a client should treat a
-stream that never delivers the terminal `done` event as a failed transcription.
+`transcript.text.done` event (the server logs the error with the request id); a
+client should treat a stream that never delivers the terminal `done` event as a
+failed transcription.
+
+**Errors** use the OpenAI envelope
+`{"error": {"message", "type", "param", "code"}}`: `400` for bad/missing
+params or undecodable input, `401` for auth (`code: "invalid_api_key"`), `413`
+for oversized input, `503` when the inference queue is full.
+
+### Multiple models (optional)
+
+Set `PARASCRIBE_MODELS` to a comma-separated allow-list to serve more than one
+model from a single process; the request `model` then selects one (unknown ids
+return 400, an empty value falls back to `MODEL_ID`). Models load on demand:
+with `MAX_RESIDENT_MODELS=1` (default) the resident model is swapped on switch
+(safe for small VRAM, ~seconds of load latency), higher values keep models
+co-resident for instant switching. `MODEL_TTL_S` optionally evicts idle models.
+The default `MODEL_ID` is always preloaded at startup, so the GPU
+fail-loud check still applies. `GET /v1/models` lists exactly the accepted ids.
+Details: `specs/multi-model-registry/spec.md`.
 
 ### Token costs
 
@@ -183,7 +208,11 @@ event) include an OpenAI `tokens`-style `usage` object so a LiteLLM gateway in
 front can track spend. Without it, LiteLLM logs **0 tokens** for every request.
 
 ```json
-"usage": { "type": "tokens", "input_tokens": 36000, "output_tokens": 1342, "total_tokens": 37342 }
+"usage": {
+  "type": "tokens", "input_tokens": 36000, "output_tokens": 1342,
+  "total_tokens": 37342,
+  "input_token_details": { "text_tokens": 0, "audio_tokens": 36000 }
+}
 ```
 
 Parakeet doesn't charge by token, so you decide how the numbers are counted. Three
@@ -252,9 +281,17 @@ curl -s http://127.0.0.1:8000/v1/audio/transcriptions \
 
 ### `GET /health`
 
+Unauthenticated liveness probe:
+
 ```json
-{"status": "ok", "model_id": "...", "device": "cuda:0", "provider_active": true}
+{"status": "ok", "model_id": "...", "device": "cuda:0", "provider_active": true,
+ "mode": "single", "models": ["..."], "loaded": ["..."]}
 ```
+
+### `GET /v1/models`
+
+OpenAI-compatible model list (bearer-auth): exactly the ids the transcription
+route accepts. Single-model mode lists the one configured model.
 
 ## Deployment
 
@@ -263,12 +300,14 @@ tmpfs `RuntimeDirectory`, GPU device allow-list, writable HF cache).
 
 ## Known issues
 
-- **Diarization runs on CPU only.** pyannote's GPU PyTorch can't share a process
-  with onnxruntime-gpu — they collide over bundled CUDA libraries (an
-  `ncclCommResume` / cuDNN symbol clash) — so diarization needs the CPU torch
-  build (see `requirements-diarization.txt`) with `PARASCRIBE_DIARIZATION_DEVICE=cpu`.
-  On long files that's slow (roughly real-time). GPU diarization is on the
-  [roadmap](ROADMAP.md).
+- **Diarization on GPU is card-dependent.** `PARASCRIBE_DIARIZATION_DEVICE`
+  defaults to following the ASR provider, and a modern card (e.g. sm_86 3090)
+  runs pyannote on GPU. On Pascal (1080 Ti), torch >= 2.8 may lack sm_61 kernels
+  and the bundled CUDA libraries can clash with onnxruntime-gpu in one process
+  (`ncclCommResume` / cuDNN symbol errors) — set
+  `PARASCRIBE_DIARIZATION_DEVICE=cpu` there. CPU diarization is slow on long
+  files (roughly the audio's duration). Process-isolated GPU diarization is on
+  the [roadmap](ROADMAP.md).
 - **In-flight requests can't be cancelled.** Inference runs in a worker thread, so
   a long request can't be interrupted and blocks graceful shutdown (`kill -9` to
   force). Moving inference to a subprocess is on the roadmap.

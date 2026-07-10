@@ -45,8 +45,11 @@ multi-model; see `specs/multi-model-registry/spec.md`).
 ## 4. Tech stack
 
 - Python 3.11+, **FastAPI** + **uvicorn**.
-- **venv + pip** for environment and packaging (not uv). Pinned deps in
-  `requirements.txt`; dev/test tooling in `requirements-dev.txt`.
+- **venv + pip** for environment and packaging (not uv). Shared runtime deps
+  pinned in `requirements.txt` (no onnxruntime variant); the pinned
+  `onnxruntime-gpu` lives in `requirements-gpu.txt` and CPU `onnxruntime` in
+  `requirements-cpu.txt`; dev/test tooling in `requirements-dev.txt`; optional
+  diarization extras in `requirements-diarization.txt`.
 - **`onnx-asr`** for inference, VAD, and timestamps. Requires `huggingface_hub`
   for the model download.
 - **`onnxruntime-gpu`** — pinned to a Pascal-compatible build (§8). CPU
@@ -103,8 +106,12 @@ non-goal and not exposed.
 
 ### 5.2 Model loading
 
-- Load **once** at startup (lifespan/startup), hold the instance. No lazy-load,
-  no TTL — dedicated single-model service.
+- The **registry** (`registry.py`) owns model lifecycle. Single mode (empty
+  `models` allow-list): one model loaded at startup, held for the process
+  lifetime. Multi mode: the request `model` selects from the allow-list,
+  loaded lazily, with up to `max_resident_models` resident (LRU eviction) and
+  an optional idle TTL; the default model is always preloaded at startup so
+  the GPU check below still fires. See `specs/multi-model-registry/spec.md`.
 - GPU pinning via the CUDA execution provider with a configurable `device_id`:
   ```python
   providers = [("CUDAExecutionProvider", {"device_id": settings.gpu_device_id})]
@@ -172,9 +179,13 @@ Pipeline:
    log-probability, not exponentiated). Concatenate text.
 6. Return unified `verbose_json` (or the requested format).
 
-`chunk_overlap_s` (decision #2) defaults to **0**; it maps to VAD pad, not an
-overlap-dedup step. There is no cross-chunk text dedup to do because the library
-cuts at silence — that whole class of bug is gone.
+`chunk_overlap_s` (decision #2) defaults to **0**; it maps to VAD pad
+(`speech_pad_ms`), not an overlap-dedup step. There is no cross-chunk text dedup
+to do because the library cuts at silence — that whole class of bug is gone.
+With a non-zero pad, audio at a seam may be transcribed in both neighboring
+segments (no dedup exists), and a padded VAD window can extend past the file's
+edges — `stitch.py` clamps every emitted timestamp to `[0, duration]` so padding
+artifacts never become plausible-looking times (invariant #4).
 
 **The token-offset + word-grouping logic must be unit-tested in isolation** (§11)
 with synthetic `TimestampedSegmentResult`-shaped inputs. It is the part most
@@ -234,7 +245,11 @@ Params (OpenAI-compatible):
     { "id": 0, "start": 0.00, "end": 4.20, "text": "...", "speaker": null, "avg_logprob": -0.12 }
   ],
   "words": [ { "word": "...", "start": 0.00, "end": 0.32 } ],
-  "usage": { "type": "tokens", "input_tokens": 36000, "output_tokens": 1342, "total_tokens": 37342 }
+  "usage": {
+    "type": "tokens", "input_tokens": 36000, "output_tokens": 1342,
+    "total_tokens": 37342,
+    "input_token_details": { "text_tokens": 0, "audio_tokens": 36000 }
+  }
 }
 ```
 - `usage` is present on the `json` and `verbose_json` bodies (and the streaming
@@ -289,16 +304,33 @@ moves to GPU (it drops toward ~2).
 
 ### `GET /health`
 
-200 with `{status, model_id, device, provider_active}` once the model is loaded
-and GPU verified. Used by systemd/LiteLLM liveness.
+200 with `{status, model_id, device, provider_active, mode, models, loaded}`
+once the model is loaded and GPU verified (`mode` is `single`/`multi`; `models`
+is the allow-list; `loaded` the currently resident ids). Unauthenticated, for
+systemd/LiteLLM liveness.
+
+### `GET /v1/models`
+
+OpenAI-compatible model list (bearer-auth): exactly the ids the transcription
+route accepts, so a listed model never 400s. Single mode lists the one
+configured model. See `specs/multi-model-registry/spec.md`.
 
 ### Errors
 
+All error responses use the OpenAI envelope
+`{"error": {"message", "type", "param", "code"}}` — `type` is
+`invalid_request_error` (4xx) or `server_error` (5xx); 401 carries
+`code: "invalid_api_key"`.
+
 - Missing/unreadable/undecodable file → **400**, not 500.
+- Missing required param (`file`, `model`) → **400** (not FastAPI's default 422).
+- Decode subprocess exceeding `decode_timeout_s` → **400**.
 - Auth failure → **401**.
 - Unsupported `response_format` value → **400** with the allowed list.
 - Oversized upload (> `max_upload_mb`) → **413**.
-- Inference queue saturated (if a bounded wait queue is used) → **503**.
+- Inference queue saturated → **503**.
+- `api_key_file` set but missing/empty → **startup failure** (never a silently
+  unauthenticated server).
 
 ## 8. Pascal / ONNX Runtime constraint (easy to get wrong)
 
@@ -309,7 +341,7 @@ working wheel exists.
 
 - **Pin `onnxruntime-gpu`** to a version verified to include sm_61 / CUDA provider
   support. Document the pinned version and the CUDA/cuDNN it expects in the README
-  and `requirements.txt`. Do not float the dependency.
+  and `requirements-gpu.txt`. Do not float the dependency.
 - **Match the CUDA userspace wheels to the host driver.** The bundled
   `nvidia-*-cu12` wheels ship a specific CUDA minor; the host NVIDIA driver runs an
   equal-or-older runtime, never a newer one. A 550-series driver (CUDA 12.4
@@ -362,7 +394,8 @@ Unit:
 - **Offset stitching** (highest priority): feed synthetic per-chunk results with
   known offsets; assert merged segment **and word** times are monotonic, start at
   ~0, and each equals chunk-local time + offset. Cover a region exceeding
-  `max_chunk_s`. Cover overlap dedup when `chunk_overlap_s > 0`.
+  `max_chunk_s`. Cover timestamp clamping to `[0, duration]` when VAD padding
+  (`chunk_overlap_s > 0`) pushes a segment window past the file's edges.
 - Response formatting: `verbose_json` / `srt` / `vtt` / `text` / `json` from a
   fixed segment list.
 - Auth: 401 without / with-wrong key; 200 with correct.
@@ -389,32 +422,37 @@ helper) — keep large media out of the repo.
 
 ```
 parascribe/
-  requirements.txt        # shared runtime deps (no onnxruntime variant)
-  requirements-gpu.txt     # -r requirements.txt + pinned onnxruntime-gpu (deploy)
-  requirements-cpu.txt     # -r requirements.txt + onnxruntime (dev / M1)
-  requirements-dev.txt     # -r requirements-cpu.txt + pytest, ruff, mypy, httpx
-  pyproject.toml          # tool config (ruff/mypy/pytest); deps via requirements*
-  .env.example            # documented config
-  README.md               # what/why, venv install, config table, Pascal note, curl examples
-  LICENSE                 # MIT
-  CLAUDE.md               # invariants + conventions
-  SPEC.md                 # this document (single source of truth)
+  requirements.txt            # shared runtime deps (no onnxruntime variant)
+  requirements-gpu.txt        # -r requirements.txt + pinned onnxruntime-gpu (deploy)
+  requirements-cpu.txt        # -r requirements.txt + onnxruntime (dev / M1)
+  requirements-dev.txt        # -r requirements-cpu.txt + pytest, ruff, mypy, httpx
+  requirements-diarization.txt # optional pyannote.audio (Phase 1, heavy)
+  pyproject.toml              # tool config (ruff/mypy/pytest); deps via requirements*
+  .env.example                # documented config
+  README.md                   # what/why, venv install, config table, Pascal note, curl examples
+  ROADMAP.md                  # post-MVP ideas
+  LICENSE                     # MIT
+  CLAUDE.md                   # invariants + conventions
+  SPEC.md                     # this document (single source of truth)
+  specs/                      # per-feature specs (multi-model-registry, ...)
   src/parascribe/
     __init__.py
     main.py               # FastAPI app, lifespan load, routes, inference gate, SSE
     config.py             # pydantic-settings
     asr.py                # onnx-asr load + GPU verify + VAD transcribe generator
+    registry.py           # model registry: allow-list, lazy load, LRU/TTL eviction
     media.py              # ffmpeg decode to 16k mono + video detection
     stitch.py             # token offset + subword->word grouping + assembly (the crux)
+    align.py              # speaker-turn -> word/segment alignment (Phase 1)
+    diarize.py            # pyannote wrapper (Phase 1)
+    fetch.py              # SSRF-guarded URL-input fetch
     formats.py            # json/verbose_json/srt/vtt/text + SSE serialization
+    usage.py              # configurable OpenAI usage accounting
     auth.py               # bearer, constant-time
+    log.py                # content-free logging config, rid filter
   scripts/
     check_gpu.py          # prints active execution provider; non-zero if CUDA requested-but-absent
-  tests/
-    test_stitch.py        # the crux
-    test_media.py         # ffmpeg decode
-    test_formats.py
-    test_auth.py
+  tests/                  # mirrors src: test_<module>.py per module, plus
     test_api.py           # routes, streaming, video gating, gate (model faked)
     test_integration.py   # real model, opt-in (PARASCRIBE_RUN_MODEL_TESTS), gpu-marked
   deploy/
@@ -426,8 +464,12 @@ parascribe/
 `model_id` (default `istupakov/parakeet-tdt-0.6b-v3-onnx`), `gpu_device_id`,
 `host`, `port`, `api_key` / `api_key_file`, `work_dir` (tmpfs default
 `/run/parascribe`), `max_chunk_s`, `chunk_overlap_s` (default 0), `vad_threshold`,
-`max_upload_mb`, `enable_video`, `debug_logging` (default false),
-`default_language` (optional). Provide a `.env.example`.
+`max_upload_mb`, `decode_timeout_s` (default 300), `max_queue`, `enable_video`,
+`enable_url_fetch` / `url_fetch_allowlist` / `url_fetch_timeout_s`,
+`models` / `max_resident_models` / `model_ttl_s` (multi-model, see
+`specs/multi-model-registry/spec.md`), the `*_usage_*` billing knobs (§7),
+diarization settings (§15.6), `log_level`, `debug_logging` (default false),
+`default_language` (optional). `.env.example` documents every key.
 
 ## 14. How to proceed (build order)
 
@@ -438,8 +480,8 @@ parascribe/
 3. Implement `asr.py` (load + single-chunk transcribe) and `scripts/check_gpu.py`;
    verify GPU engagement conceptually (real sm_61 verification happens on the
    deployer's hardware).
-4. Implement `chunking.py` and `stitch.py`; **write `test_stitch.py` alongside**
-   and make it pass before wiring the API.
+4. Implement `stitch.py` (the hand-rolled `chunking.py` was dropped, see §12);
+   **write `test_stitch.py` alongside** and make it pass before wiring the API.
 5. Implement `formats.py`, then `main.py` routes (non-streaming first) with the
    serialized inference queue (§5.3), `auth.py`, `/health`, error mapping.
 6. Add streaming (§10) using the chunk generator — after non-streaming is done.

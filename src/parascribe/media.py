@@ -25,13 +25,17 @@ logger = logging.getLogger(__name__)
 
 _FFMPEG = "ffmpeg"
 _FFPROBE = "ffprobe"
+# Decode runs at 100x+ realtime (pure decompression, no inference), so this
+# covers even multi-hour uploads; a subprocess still running after this long is
+# hung on pathological input, not working. Transcription itself is not timed.
+DEFAULT_TIMEOUT_S = 300.0
 
 
 class DecodeError(RuntimeError):
     """Input could not be decoded to audio (maps to HTTP 400)."""
 
 
-def contains_video(source: Path) -> bool:
+def contains_video(source: Path, *, timeout_s: float = DEFAULT_TIMEOUT_S) -> bool:
     """True if ``source`` has a real video stream (ignoring attached cover art).
 
     Audio files commonly embed cover art as an mjpeg "video" stream with the
@@ -47,9 +51,12 @@ def contains_video(source: Path) -> bool:
         str(source),
     ]
     try:
-        proc = subprocess.run(cmd, capture_output=True, check=True)
+        proc = subprocess.run(cmd, capture_output=True, check=True, timeout=timeout_s)
     except FileNotFoundError as exc:
         raise DecodeError("ffprobe executable not found on PATH") from exc
+    except subprocess.TimeoutExpired as exc:
+        logger.warning("ffprobe timed out after %.0fs", timeout_s)
+        raise DecodeError("input media could not be probed in time") from exc
     except subprocess.CalledProcessError as exc:
         detail = exc.stderr.decode("utf-8", "replace").strip()
         logger.warning("ffprobe failed (rc=%s): %s", exc.returncode, detail[:300])
@@ -58,7 +65,9 @@ def contains_video(source: Path) -> bool:
     return any(line.strip() == "0" for line in proc.stdout.decode().splitlines())
 
 
-def decode_to_pcm(source: Path) -> npt.NDArray[np.float32]:
+def decode_to_pcm(
+    source: Path, *, timeout_s: float = DEFAULT_TIMEOUT_S
+) -> npt.NDArray[np.float32]:
     """Decode ``source`` (audio or video) to a 16 kHz mono float32 PCM array.
 
     ffmpeg selects the audio stream automatically, so the same command handles a
@@ -76,9 +85,12 @@ def decode_to_pcm(source: Path) -> npt.NDArray[np.float32]:
         "pipe:1",
     ]
     try:
-        proc = subprocess.run(cmd, capture_output=True, check=True)
+        proc = subprocess.run(cmd, capture_output=True, check=True, timeout=timeout_s)
     except FileNotFoundError as exc:
         raise DecodeError("ffmpeg executable not found on PATH") from exc
+    except subprocess.TimeoutExpired as exc:
+        logger.warning("ffmpeg decode timed out after %.0fs", timeout_s)
+        raise DecodeError("input could not be decoded in time") from exc
     except subprocess.CalledProcessError as exc:
         detail = exc.stderr.decode("utf-8", "replace").strip()
         logger.warning("ffmpeg decode failed (rc=%s): %s", exc.returncode, detail[:300])

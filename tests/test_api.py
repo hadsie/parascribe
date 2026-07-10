@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import subprocess
+import threading
 from pathlib import Path
 
 import pytest
@@ -13,7 +15,13 @@ from fastapi.testclient import TestClient
 from parascribe.align import SpeakerTurn
 from parascribe.asr import RawSegment
 from parascribe.config import Settings
-from parascribe.main import InferenceGate, QueueFullError, create_app
+from parascribe.main import (
+    InferenceGate,
+    QueueFullError,
+    _start_stream_producer,
+    _stream_events,
+    create_app,
+)
 from parascribe.registry import ModelRegistry
 
 _TOK = [" The", " second", " part", "."]
@@ -40,10 +48,12 @@ class FakeDiarizer:
 
 @pytest.fixture
 def wav(tmp_path: Path) -> Path:
+    # 6s so the CANNED segment times (up to 6.0) fit inside the real duration;
+    # emitted timestamps are clamped to the decoded audio's extent.
     out = tmp_path / "clip.wav"
     subprocess.run(
         ["ffmpeg", "-v", "error", "-f", "lavfi",
-         "-i", "sine=frequency=300:duration=1:sample_rate=16000", str(out), "-y"],
+         "-i", "sine=frequency=300:duration=6:sample_rate=16000", str(out), "-y"],
         check=True,
     )
     return out
@@ -117,6 +127,45 @@ class TestAuth:
             assert post(client, wav).status_code == 200
 
 
+class TestErrorEnvelope:
+    """Errors must use the OpenAI {"error": {...}} shape, not FastAPI's detail."""
+
+    def test_401_uses_openai_envelope(self, tmp_path, wav):
+        with make_client(tmp_path) as client:
+            r = post(client, wav, key="wrong")
+            err = r.json()["error"]
+            assert err["type"] == "invalid_request_error"
+            assert err["code"] == "invalid_api_key"
+            assert r.headers["www-authenticate"] == "Bearer"
+
+    def test_bad_response_format_is_400_envelope(self, tmp_path, wav):
+        with make_client(tmp_path) as client:
+            r = post(client, wav, response_format="nope")
+            assert r.status_code == 400
+            assert r.json()["error"]["type"] == "invalid_request_error"
+
+    def test_missing_model_param_is_400_not_422(self, tmp_path, wav):
+        with make_client(tmp_path) as client:
+            with wav.open("rb") as fh:
+                r = client.post(
+                    "/v1/audio/transcriptions",
+                    files={"file": ("clip.wav", fh, "audio/wav")},
+                    headers={"Authorization": "Bearer secret"},
+                )
+            assert r.status_code == 400
+            assert r.json()["error"]["param"] == "model"
+
+    def test_missing_file_param_is_400_not_422(self, tmp_path):
+        with make_client(tmp_path) as client:
+            r = client.post(
+                "/v1/audio/transcriptions",
+                data={"model": "parascribe"},
+                headers={"Authorization": "Bearer secret"},
+            )
+            assert r.status_code == 400
+            assert r.json()["error"]["param"] == "file"
+
+
 class TestResponseFormats:
     def test_json_returns_text_and_usage(self, tmp_path, wav):
         with make_client(tmp_path) as client:
@@ -125,8 +174,8 @@ class TestResponseFormats:
             assert body["text"] == "The first part. The second part."
             # 2 canned segments * 4 subword tokens, billed 1:1, no diarization.
             assert body["usage"]["output_tokens"] == 8
-            # Audio input: 1s wav * 10 (OpenAI-parity default) -> input_tokens.
-            assert body["usage"]["input_tokens"] == 10
+            # Audio input: 6s wav * 10 (OpenAI-parity default) -> input_tokens.
+            assert body["usage"]["input_tokens"] == 60
 
     def test_verbose_json_has_segments_without_granularities(self, tmp_path, wav):
         # Invariant #1: segments + real times without timestamp_granularities[].
@@ -378,6 +427,141 @@ class TestDiarization:
             assert r.json()["segments"][0]["speaker"] == "SPEAKER_00"
 
 
+@pytest.fixture
+def parascribe_log(caplog):
+    """Capture the parascribe logger (no root propagation).
+
+    configure_logging clears the logger's handlers at app startup, so tests must
+    call ``attach()`` after entering the TestClient context, then read records
+    off the fixture.
+    """
+    logger = logging.getLogger("parascribe")
+
+    class Capture:
+        @property
+        def records(self):
+            return caplog.records
+
+        @staticmethod
+        def attach() -> None:
+            logger.addHandler(caplog.handler)
+
+    try:
+        yield Capture()
+    finally:
+        logger.removeHandler(caplog.handler)
+
+
+class TestForensicCleanliness:
+    """Invariant: no transcript text, filenames, or URLs in logs at INFO."""
+
+    def _log_blob(self, caplog) -> str:
+        return " ".join(r.getMessage() for r in caplog.records)
+
+    def test_no_content_or_filename_in_logs_at_info(self, tmp_path, wav, parascribe_log):
+        with make_client(tmp_path) as client:
+            parascribe_log.attach()
+            post(client, wav, response_format="verbose_json")
+        blob = self._log_blob(parascribe_log)
+        assert "done:" in blob  # capture sanity: operational line was logged
+        assert "first part" not in blob.lower()  # transcript content
+        assert "clip.wav" not in blob  # original filename
+
+    def test_url_never_logged_even_on_fetch_failure(self, tmp_path, parascribe_log, monkeypatch):
+        from parascribe.fetch import FetchError
+
+        def boom(*a, **k):
+            raise FetchError("could not fetch URL")
+
+        monkeypatch.setattr("parascribe.main.fetch_to_file", boom)
+        with make_client(tmp_path, enable_url_fetch=True) as client:
+            parascribe_log.attach()
+            client.post(
+                "/v1/audio/transcriptions",
+                files={"file": ("s.url", b"https://secret-host.example.com/a.wav", "text/plain")},
+                data={"model": "parascribe"},
+                headers={"Authorization": "Bearer secret"},
+            )
+        assert "secret-host.example.com" not in self._log_blob(parascribe_log)
+
+    def test_debug_logging_gates_transcript_content(self, tmp_path, wav, parascribe_log):
+        # Off (default): content stays out even of DEBUG-capable capture.
+        with make_client(tmp_path) as client:
+            parascribe_log.attach()
+            post(client, wav)
+        assert "first part" not in self._log_blob(parascribe_log).lower()
+
+    def test_debug_logging_exposes_content_when_enabled(self, tmp_path, wav, parascribe_log):
+        with make_client(tmp_path, debug_logging=True) as client:
+            parascribe_log.attach()
+            post(client, wav)
+        assert "first part" in self._log_blob(parascribe_log).lower()
+
+
+class TestUploadCleanup:
+    """Invariant: the upload temp file is deleted on every path."""
+
+    def _workdir_entries(self, tmp_path) -> list:
+        return list((tmp_path / "work").iterdir())
+
+    def test_removed_after_success(self, tmp_path, wav):
+        with make_client(tmp_path) as client:
+            assert post(client, wav).status_code == 200
+            assert self._workdir_entries(tmp_path) == []
+
+    def test_removed_after_decode_error(self, tmp_path):
+        with make_client(tmp_path) as client:
+            r = client.post(
+                "/v1/audio/transcriptions",
+                files={"file": ("junk.bin", b"not audio at all" * 100, "audio/wav")},
+                data={"model": "parascribe"},
+                headers={"Authorization": "Bearer secret"},
+            )
+            assert r.status_code == 400
+            assert self._workdir_entries(tmp_path) == []
+
+    def test_removed_after_413(self, tmp_path, wav):
+        with make_client(tmp_path, max_upload_mb=0) as client:
+            assert post(client, wav).status_code == 413
+            assert self._workdir_entries(tmp_path) == []
+
+    def test_removed_after_video_rejection(self, tmp_path, video):
+        with make_client(tmp_path) as client:  # enable_video defaults False
+            assert post(client, video).status_code == 400
+            assert self._workdir_entries(tmp_path) == []
+
+
+class TestGateSadPaths:
+    def test_saturated_gate_returns_503_envelope(self, tmp_path, wav, monkeypatch):
+        async def full(self):
+            raise QueueFullError
+
+        monkeypatch.setattr("parascribe.main.InferenceGate.acquire", full)
+        with make_client(tmp_path) as client:
+            r = post(client, wav)
+            assert r.status_code == 503
+            assert r.json()["error"]["type"] == "server_error"
+
+    def test_gate_released_when_model_load_fails(self, tmp_path, wav):
+        settings = Settings(
+            execution_provider="cpu", work_dir=tmp_path / "work",
+            api_key="secret", models=["good", "bad"],
+        )
+
+        def factory(model_id):
+            if model_id == "bad":
+                raise RuntimeError("model load failed")
+            return FakeTranscriber()
+
+        registry = ModelRegistry(settings, factory=factory)
+        registry.preload()
+        app = create_app(settings=settings, registry=registry)
+        with TestClient(app, raise_server_exceptions=False) as client:
+            assert post(client, wav, model="bad").status_code == 500
+            # The slot came back: a follow-up request must not hang or 503.
+            assert post(client, wav, model="good").status_code == 200
+
+
 class TestInferenceGate:
     async def test_rejects_beyond_capacity(self):
         gate = InferenceGate(capacity=1)
@@ -401,3 +585,80 @@ class TestInferenceGate:
         for i in range(0, len(order), 2):
             assert order[i][0] == "start" and order[i + 1][0] == "end"
             assert order[i][1] == order[i + 1][1]
+
+
+class SlowSecondSegment:
+    """Transcriber whose second forward pass blocks until ``unblock`` is set."""
+
+    device = "cpu"
+    provider_active = True
+
+    def __init__(self) -> None:
+        self.unblock = threading.Event()
+
+    def transcribe(self, audio, *, language=None):
+        yield CANNED[0]
+        assert self.unblock.wait(timeout=5)
+        yield CANNED[1]
+
+
+class TestStreamingGate:
+    """The producer thread owns the gate; the SSE generator only consumes."""
+
+    SETTINGS = {"execution_provider": "cpu", "api_key": "k"}
+
+    def _start(self, transcriber, gate, rid="t"):
+        queue: asyncio.Queue = asyncio.Queue()
+        stop = threading.Event()
+        worker = _start_stream_producer(
+            transcriber, gate, None, queue, stop, language_hint=None, rid=rid
+        )
+        return worker, queue, stop
+
+    async def test_disconnect_holds_gate_until_forward_pass_ends(self):
+        gate = InferenceGate(capacity=4)
+        await gate.acquire()
+        transcriber = SlowSecondSegment()
+        worker, queue, stop = self._start(transcriber, gate)
+        gen = _stream_events(
+            worker, queue, stop,
+            settings=Settings(**self.SETTINGS), language_hint=None, duration=6.0,
+            response_format="json", include_words=False, rid="t",
+        )
+        assert (await gen.__anext__()).startswith("data: ")
+        await gen.aclose()  # client disconnects mid-stream
+        assert stop.is_set()
+        # The fake forward pass is still running: the gate must still be held.
+        with pytest.raises(TimeoutError):
+            await asyncio.wait_for(gate.acquire(), timeout=0.2)
+        transcriber.unblock.set()
+        # Released only once the producer thread actually finishes.
+        await asyncio.wait_for(gate.acquire(), timeout=2)
+        gate.release()
+
+    async def test_gate_released_when_stream_is_never_consumed(self):
+        # A client can vanish before Starlette ever iterates the generator; the
+        # done-callback must release the gate regardless.
+        gate = InferenceGate(capacity=4)
+        await gate.acquire()
+        worker, _queue, _stop = self._start(FakeTranscriber(), gate)
+        await worker
+        await asyncio.wait_for(gate.acquire(), timeout=2)
+        gate.release()
+
+    async def test_producer_error_released_and_logged_with_rid(self, caplog):
+        class Boom:
+            def transcribe(self, audio, *, language=None):
+                raise RuntimeError("onnxruntime failure")
+                yield  # pragma: no cover
+
+        gate = InferenceGate(capacity=4)
+        await gate.acquire()
+        with caplog.at_level(logging.ERROR, logger="parascribe.main"):
+            worker, _queue, _stop = self._start(Boom(), gate, rid="rid1")
+            with pytest.raises(RuntimeError):
+                await worker
+            await asyncio.wait_for(gate.acquire(), timeout=2)
+            gate.release()
+        errors = [r for r in caplog.records if "stream inference failed" in r.getMessage()]
+        assert errors and errors[0].rid == "rid1"

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import pytest
+
 from parascribe.config import Settings
 
 
@@ -55,3 +57,43 @@ class TestUsageSettings:
         monkeypatch.setenv("PARASCRIBE_EXECUTION_PROVIDER", "cpu")
         monkeypatch.setenv("PARASCRIBE_AUDIO_INPUT_USAGE_FIELD", "output_tokens")
         assert Settings().audio_input_usage_field == "output_tokens"
+
+
+class TestSecretResolution:
+    def test_direct_api_key_is_returned(self):
+        s = Settings(execution_provider="cpu", api_key="k")
+        assert s.resolved_api_key() == "k"
+
+    def test_neither_set_returns_none(self):
+        s = Settings(execution_provider="cpu")
+        assert s.resolved_api_key() is None
+
+    def test_api_key_file_is_read_and_stripped(self, tmp_path):
+        keyfile = tmp_path / "key"
+        keyfile.write_text("  sekrit\n")
+        s = Settings(execution_provider="cpu", api_key_file=keyfile)
+        assert s.resolved_api_key() == "sekrit"
+
+    def test_direct_api_key_wins_over_file(self, tmp_path):
+        keyfile = tmp_path / "key"
+        keyfile.write_text("from-file")
+        s = Settings(execution_provider="cpu", api_key="direct", api_key_file=keyfile)
+        assert s.resolved_api_key() == "direct"
+
+    def test_missing_api_key_file_raises(self, tmp_path):
+        # A typo'd key-file path must not silently disable auth.
+        s = Settings(execution_provider="cpu", api_key_file=tmp_path / "nope")
+        with pytest.raises(ValueError, match="missing file"):
+            s.resolved_api_key()
+
+    def test_empty_api_key_file_raises(self, tmp_path):
+        keyfile = tmp_path / "key"
+        keyfile.write_text("  \n")
+        s = Settings(execution_provider="cpu", api_key_file=keyfile)
+        with pytest.raises(ValueError, match="empty file"):
+            s.resolved_api_key()
+
+    def test_missing_hf_token_file_raises(self, tmp_path):
+        s = Settings(execution_provider="cpu", hf_token_file=tmp_path / "nope")
+        with pytest.raises(ValueError, match="missing file"):
+            s.resolved_hf_token()
